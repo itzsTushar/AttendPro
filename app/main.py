@@ -16,6 +16,7 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from pymongo import MongoClient
+from pymongo.errors import DuplicateKeyError
 
 load_dotenv()
 
@@ -98,15 +99,15 @@ def create_employee(body: EmployeeIn):
     return doc
 
 
-@app.get("/employees")
-def list_employees(department: Optional[str] = None, page: int = 1, page_size: int = 20):
+@app.get("/employees",tags=["employees"],operation_id="listEmployees")
+def list_employees(department: Optional[str] = None, page: int = Query(1,ge=1), page_size: Query(20,ge=1,le=100)):
     q = {}
-    if department:
-        q["department"] = department
-    skip = page * page_size
-    total = db.employees.count_documents({})
-    items = list(db.employees.find(q, {"_id": 0}).skip(skip).limit(page_size))
-    return {"items": items, "total": total, "page": page, "page_size": page_size}
+    if department is not None :
+        q["department"]=department
+    total = db.employees.count_documents(q)
+    skip = (page - 1)*page_size
+    items = list(db.employees.find(q,{"_id":0}).sort("emp_code",1).skip(skip).limit(page_size))
+    return {"items":items ,"total":total,"page":page,"page_size":page_size}
 
 
 @app.post("/attendance/punch-in", status_code=201)
