@@ -81,14 +81,20 @@ def health():
             )
 
 
-@app.post("/employees", status_code=201)
+@app.post("/employees", status_code=201,tags=["employees"],operation_id="createEmployee)
 def create_employee(body: EmployeeIn):
-    if db.employees.find_one({"emp_code": body.emp_code}):
-        raise HTTPException(409, "emp_code already exists")
+    if body.shift_start == body.shift_end:
+        raise HTTPException(status_code = 422,detail = "shift_start must differ from shift_end")
+        
     doc = body.model_dump()
-    doc["created_at"] = datetime.now()
-    db.employees.insert_one(doc)
-    doc.pop("_id", None)
+    doc["created_at"] = datetime.now(timezone.utc)
+    
+    try :
+        result = db.employees.insert_one(doc)
+    except DuplicateKeyError:
+        raise HTTPException(status_code = 409 , detail = "emp_code already exists ")
+    doc["_id"] = result.inserted_id
+    doc.pop("_id",None)
     return doc
 
 
