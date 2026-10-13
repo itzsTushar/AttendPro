@@ -69,9 +69,16 @@ class PunchInIn(BaseModel):
 # --------------------------------------------------------------------------- #
 # Endpoints provided
 # --------------------------------------------------------------------------- #
-@app.get("/health")
+@app.get("/health",tags=["system"],operation_id="health")
 def health():
-    return {"status": "ok"}
+    try :
+        client.admin.command("ping")
+        return {"status": "ok"}
+    except Exception : 
+        raise HTTPException(
+            status_code = 503,
+            detail={"status":"error","message":"MongoDB unavailable"}
+            )
 
 
 @app.post("/employees", status_code=201)
