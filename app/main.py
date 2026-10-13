@@ -110,60 +110,173 @@ def list_employees(department: Optional[str] = None, page: int = Query(1,ge=1), 
     return {"items":items ,"total":total,"page":page,"page_size":page_size}
 
 
-@app.post("/attendance/punch-in", status_code=201)
+@app.post("/attendance/punch-in", status_code=201,tags=201,tags=["attendance"],operation_id="puchIn")
 def punch_in(body: PunchInIn):
     emp = db.employees.find_one({"emp_code": body.emp_code})
-    ts = datetime.fromtimestamp(body.punched_at / 1000) if body.punched_at else datetime.now()
-    d = ts.date().isoformat()
-    if db.attendance_logs.find_one({"emp_code": body.emp_code, "date": d}):
-        raise HTTPException(409, "already punched in for this date")
-    doc = {
-        "emp_code": body.emp_code,
-        "date": d,
-        "status": body.status,
-        "punch_in": ts,
-        "punch_out": None,
-        "work_hours": None,
-        "late_minutes": compute_late_minutes(ts, emp["shift_start"]),
-        "overtime_minutes": 0,
-        "half_day": False,
-        "history": [],
-    }
-    res = db.attendance_logs.insert_one(doc)
-    doc["id"] = str(res.inserted_id)
-    doc.pop("_id", None)
+    if emp is None :
+        raise HTTPException(status_code=404,detail="Employee not found")
+    status = body.status or "PRESENT"
+    if status not in {"PRESENT","WFH","ON_DUTY"}:
+        raise HTTPException(status_code=422,detail="Invalid attendance status")
+    if body.punched_ar is not None:
+        ts =datetime.fromtimestamp(body.punched_at/1000,tz=timezone.utc).astimezone(IST)
+    else :
+        ts =  datetime.now(IST)
+    ts = ts.replace(microsecond=0)
+    
+    shift_start = emp["shift_start"]
+    shift_end = emp["shift_end"]
+    
+    sh,sm = map(int,shift_start.split(":"))
+    eh,em = map(int(shift_end.split(":"))
+    
+    punch_time=ts.hour*60+ts.minute
+    start_minutes = sh*60 + sm
+    end_minutes = eh *60 + em
+    
+    attendacne_date = ts.date()
+    
+    if end_minutes <= start_minutes and punch_time < end_minutes :
+        attendance_date = -timedelta(days=1)
+    date_str = attendance_date.isoformat()
+    
+    shift_start_dt = datetime(attendance_date.year,attendance_date.month,attendance_date.day,sh,sm,tzinfo=IST)
+    elapsed_minutes =int((ts-shift_start_dt).total_seconds()//60)
+    late_minutes = (elapsed_minutes if elapsed_minutes > 10 else 0)
+    
+    doc = {"emp_code": body.emp_code,"date": date_str,"status": status,"punch_in": ts,"punch_out": None,"work_hours": None,"late_minutes": late_minutes,"overtime_minutes": 0,"half_day": False,"history": []}
+    
+    try :
+        result = db.attendance_logs.insert_one(doc)
+    except DuplicateKerError :
+        raise HTTPException(status_code = 409,detail="Already punched in for this date")
+    doc.pop("_id",None)
+    doc["id"]=str(result.inserted_id)
     return doc
+    
+@app.post("/attendance/punch-out",tags=["attendance"],operation_id="punchOut",status_code=200)
+def punch_out(body:PunchOutIn):
+    emp = db.employee.find_one({"emp_code":body.emp_code})
+    if emp is None :
+        raise HTTPException(status_code=404,detail="Employee not found")
+    if body.punched_at is not None:
+        ts.datetime.fromtimestamp(body.punched_at/1000,tz = timezone.utc).astimezone(IST)
+    else :
+        ts = datetime.now(IST)
+    ts = ts.replace(microsecond=0)
+    
+    ts_utc_naive = ts.astimezone(timezone.utc).replace(tzinfo=None)
+    record = db.attendance_logs.find_one({"emp_code":body.emp_code,"punch_in":{"$lte":ts_utc_naive}},sort = [("punch_in",-1),("_id",-1)] )
+    if record in None :
+        raise HTTPException(status_code=404.detail = "No Punch-in record found")
+        
+    punch_in = record["punch_in"]
+    if punch_in.tzinfo is None :
+        punch_in = punch_in.replace(tzinfo=timezone.utc)
+    punch_in = punch_in.astimezone(IST)
+    elapsed_seconds = (ts - punch_in).total_seconds()
+    if elapsed_seconds <= 0 or elapsed_seconds > 24 * 60 * 60:
+        raise HTTPException(status_code=422,detail="Punch-out must be after punch-in and within 24 hours")
+    if record.get("punch_out") is not None:
+        raise HTTPException(status_code=409,detail="This attendance record is already punched out")
+     #  R4: work hours with ROUND_HALF_UP.
+    seconds = Decimal(str(elapsed_seconds))
+    hours = seconds / Decimal("3600")
+    rounded_hours = hours.quantize(Decimal("0.01"),rounding=ROUND_HALF_UP)
+    work_hours = float(rounded_hours)
 
+    # R3: calculate overtime against the correct shift end.
+    shift_start = emp["shift_start"]
+    shift_end = emp["shift_end"]
+    sh, sm = map(int, shift_start.split(":"))
+    eh, em = map(int, shift_end.split(":"))
 
-@app.get("/attendance")
-def list_attendance(
-    emp_code: Optional[str] = None,
-    date_from: Optional[str] = None,
-    date_to: Optional[str] = None,
-    status: Optional[str] = None,
-    page: int = 1,
-    page_size: int = 20,
-):
+    attendance_date = datetime.fromisoformat(record["date"]).date()
+
+    shift_end_dt = datetime(attendance_date.year,attendance_date.month,attendance_date.day,eh,em, tzinfo=IST)
+
+    # Overnight shift: its end falls on the next calendar day.
+    if (eh * 60 + em) <= (sh * 60 + sm):
+        shift_end_dt += timedelta(days=1)
+
+    overtime_seconds = (ts - shift_end_dt).total_seconds()
+    overtime_minutes = max(0, int(overtime_seconds // 60))
+
+    # Only count overtime if it reaches 30 whole minutes.
+    if overtime_minutes < 30:
+        overtime_minutes = 0
+
+    # 8. R5: use rounded work hours.
+    half_day = rounded_hours < Decimal("4.50")
+
+    # 9. Atomic update: only one simultaneous request can close
+    # this record because the update requires punch_out == None.
+    updated = db.attendance_logs.find_one_and_update(
+        {
+            "_id": record["_id"],
+            "punch_out": None
+        },
+        {
+            "$set": {
+                "punch_out": ts,
+                "work_hours": work_hours,
+                "overtime_minutes": overtime_minutes,
+                "half_day": half_day
+            }
+        },
+        return_document=ReturnDocument.AFTER
+    )
+
+    if updated is None:
+        raise HTTPException(status_code=409,detail="This attendance record is already punched out")
+
+    # 10. Return the updated attendance record.
+    updated["id"] = str(updated.pop("_id"))
+
+    return updated
+@app.get("/attendance",tags=["attendance"],operation_id="listAttendance",)
+def list_attendance(emp_code: Optional[str] = None,date_from: Optional[date] = None,date_to: Optional[date] = None,status: Optional[str] = None,page: int = Query(1, ge=1),page_size: int = Query(20, ge=1, le=100)):
+    # Validate the date range
+    if date_from and date_to and date_from > date_to:
+        raise HTTPException(status_code=422,detail="date_from must be less than or equal to date_to")
+
+    # Build MongoDB query
     q = {}
-    if emp_code:
+    if emp_code is not None:
         q["emp_code"] = emp_code
     if date_from or date_to:
-        q["date"] = {}
+        date_filter = {}
         if date_from:
-            q["date"]["$gte"] = date_from
+            date_filter["$gte"] = date_from.isoformat()
         if date_to:
-            q["date"]["$lte"] = date_to
-    if status:
+            date_filter["$lte"] = date_to.isoformat()
+        q["date"] = date_filter
+    if status is not None:
+        allowed_statuses = {"PRESENT", "WFH", "ON_DUTY", "ABSENT", "LEAVE"}
+        if status not in allowed_statuses:
+            raise HTTPException(status_code=422,detail="Invalid attendance status")
         q["status"] = status
-    docs = list(db.attendance_logs.find(q))
-    docs.sort(key=lambda d: d["date"], reverse=True)
-    total = len(docs)
-    page_docs = docs[(page - 1) * page_size : page * page_size]
-    for d in page_docs:
-        d["id"] = str(d.pop("_id"))
-    return {"items": page_docs, "total": total, "page": page, "page_size": page_size}
 
+    # Count only matching records; do not load them into Python
+    total = db.attendance_logs.count_documents(q)
 
+    # Pagination and sorting happen in MongoDB
+    skip = (page - 1) * page_size
+
+    cursor = (db.attendance_logs.find(q, {"_id": 1, "emp_code": 1,
+                                     "date": 1, "status": 1,
+                                     "punch_in": 1, "punch_out": 1,
+                                     "work_hours": 1, "late_minutes": 1,
+                                     "overtime_minutes": 1, "half_day": 1,
+                                     "history": 1}).sort([("date", -1), ("emp_code", 1)]).skip(skip).limit(page_size))
+
+    items = []
+    for doc in cursor:
+        doc["id"] = str(doc.pop("_id"))
+        items.append(doc)
+
+    return {"items": items,"total": total,"page": page,"page_size": page_size}
+    
 # --------------------------------------------------------------------------- #
 # TODO - the rest of the contract (see openapi.yaml):
 #   POST  /attendance/punch-out
