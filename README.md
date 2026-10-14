@@ -1,4 +1,4 @@
-# HR Attendance System — Backend
+# Attend Pro : An HR Attendance System — Backend
 
 A REST API backend for a small HR attendance system built with **Python 3.12.3, FastAPI, and MongoDB**. Employees can punch in and out, managers can correct attendance records, and businesses can analyze late arrivals, department attendance, and attendance trends.
 
